@@ -1,0 +1,181 @@
+import http from 'node:http';
+import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const directory = path.dirname(fileURLToPath(import.meta.url));
+const dataDirectory = process.env.OFFICE_DATA_DIR || directory;
+fs.mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
+const dataFile = path.join(dataDirectory, 'office-data.json');
+const buildRoot = path.resolve(directory, '../Builds/WebGL');
+const host = process.env.OFFICE_HOST || '127.0.0.1';
+const port = Number(process.env.OFFICE_PORT || process.env.PORT || 8787);
+const allowedOrigin = process.env.OFFICE_ALLOWED_ORIGIN || '';
+const sessions = new Map();
+const identities = new Map();
+const messages = [];
+const voiceSignals = new Map();
+let pings = [];
+let presentation = null;
+let bookings = [];
+if (fs.existsSync(dataFile)) {
+  const saved = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
+  if (!Array.isArray(saved.bookings)) throw new Error('Invalid booking storage. Restore a valid office-data.json.');
+  bookings = saved.bookings;
+  for (const person of saved.identities || []) identities.set(person.token, person);
+}
+const now = () => Math.floor(Date.now() / 1000);
+const text = (value, limit) => typeof value === 'string' && value.trim().length > 0 && value.trim().length <= limit && !/[\u0000-\u001f\u007f]/.test(value) ? value.trim() : null;
+const fail = (message, status = 400) => { const error = new Error(message); error.status = status; throw error; };
+const persist = () => {
+  const temporary = dataFile + '.tmp';
+  fs.writeFileSync(temporary, JSON.stringify({ bookings, identities: [...identities.values()] }, null, 2), { mode: 0o600 });
+  fs.renameSync(temporary, dataFile);
+};
+const snapshot = () => {
+  for (const [key, player] of sessions) if (player.seen < now() - 60) sessions.delete(key);
+  pings = pings.filter(p => p.expires > now());
+  return {
+    bookings: bookings.filter(b => b.end > now()),
+    participants: [...sessions.values()].map(({ token, ...person }) => person),
+    messages, pings, presentation
+  };
+};
+function authenticate(token) {
+  if (typeof token !== 'string' || token.length > 100) fail('Join a session first.', 401);
+  const session = sessions.get(token);
+  if (!session || session.seen < now() - 60) fail('Session expired. Join again.', 401);
+  session.seen = now();
+  return session;
+}
+// A single Node process serializes the conflict check and booking write without awaits.
+function transact(body) {
+  if (body.action === 'join') {
+    const name = text(body.name, 24);
+    if (!name) fail('Enter a display name (1–24 characters).');
+    snapshot();
+    if (sessions.size >= 32) fail('This prototype is limited to 32 simultaneous users.', 429);
+    const known = typeof body.token === 'string' ? identities.get(body.token) : null;
+    const token = known ? known.token : randomUUID() + randomUUID();
+    const player = { token, id: known ? known.id : randomUUID(), name, x: 0, y: 0, z: 0, yaw: 0, seen: now() };
+    identities.set(token, { token, id: player.id, name });
+    persist();
+    sessions.set(token, player);
+    return { ok: true, token, id: player.id, state: snapshot() };
+  }
+  const player = authenticate(body.token);
+  if (body.action === 'voice-poll') {
+    const state = snapshot();
+    const signals = (voiceSignals.get(player.id) || []).filter(s => s.time > now() - 30);
+    voiceSignals.delete(player.id);
+    return { ok: true, peers: state.participants.map(p => ({ id: p.id, name: p.name })), signals };
+  } else if (body.action === 'voice-signal') {
+    const target = [...sessions.values()].find(p => p.id === body.to && p.seen >= now() - 60);
+    if (!target || target.id === player.id) fail('Voice recipient is not connected.', 404);
+    const data = body.signal;
+    if (!data || !['offer', 'answer', 'candidate'].includes(data.type) || JSON.stringify(data).length > 24000) fail('Invalid voice signal.');
+    if ((data.type === 'offer' || data.type === 'answer') && typeof data.sdp !== 'string') fail('Missing voice description.');
+    if (data.type === 'candidate' && (!data.candidate || typeof data.candidate.candidate !== 'string')) fail('Missing voice candidate.');
+    const queue = (voiceSignals.get(target.id) || []).filter(s => s.time > now() - 30);
+    if (queue.length >= 64) fail('Voice signal queue is full.', 429);
+    queue.push({ from: player.id, signal: data, time: now() }); voiceSignals.set(target.id, queue);
+    return { ok: true };
+  } else if (body.action === 'sync') {
+    for (const axis of ['x', 'y', 'z', 'yaw']) {
+      if (!Number.isFinite(body[axis]) || Math.abs(body[axis]) > 10000) fail('Invalid player position.');
+    }
+    for (const axis of ['x', 'y', 'z', 'yaw']) player[axis] = body[axis];
+  } else if (body.action === 'book') {
+    const title = text(body.title, 80);
+    if (!title || body.roomId !== 'meeting-01') fail('Choose Meeting 01 and enter a title (1–80 characters).');
+    if (!Number.isInteger(body.start) || !Number.isInteger(body.end) || body.start < now() - 60 || body.start > now() + 7 * 86400 || body.end - body.start < 15 * 60 || body.end - body.start > 120 * 60) fail('Bookings must last 15–120 minutes and begin within the next seven days.');
+    if (bookings.some(b => b.roomId === body.roomId && b.start < body.end && b.end > body.start)) fail('That time overlaps another reservation.', 409);
+    if (bookings.filter(b => b.owner === player.id && b.end > now()).length >= 8) fail('Limit of eight active reservations per session reached.', 429);
+    const prior = bookings;
+    bookings = [...bookings.filter(b => b.end > now()), { id: randomUUID(), roomId: body.roomId, title, owner: player.id, start: body.start, end: body.end }];
+    try { persist(); } catch (error) { bookings = prior; throw error; }
+  } else if (body.action === 'cancel') {
+    const booking = bookings.find(b => b.id === body.bookingId);
+    if (!booking) fail('Reservation no longer exists.', 404);
+    if (booking.owner !== player.id) fail('Only the booking owner can cancel this reservation.', 403);
+    const prior = bookings;
+    bookings = bookings.filter(b => b !== booking);
+    try { persist(); } catch (error) { bookings = prior; throw error; }
+  } else if (body.action === 'present') {
+    const title = text(body.title, 80);
+    const url = text(body.text, 500);
+    let parsed;
+    try { parsed = new URL(url); } catch { fail('Enter a valid HTTPS presentation link.'); }
+    if (!title || parsed.protocol !== 'https:' || parsed.username || parsed.password) fail('Enter a title and an HTTPS link without embedded credentials.');
+    presentation = { title, url: parsed.href, name: player.name };
+  } else if (body.action === 'ping') {
+    const label = text(body.text, 100);
+    if (!label || ['x', 'y', 'z'].some(axis => !Number.isFinite(body[axis]) || Math.abs(body[axis]) > 10000)) fail('Invalid location marker.');
+    pings.push({ id: randomUUID(), name: player.name, label, x: body.x, y: body.y, z: body.z, expires: now() + 10 });
+    pings = pings.slice(-12);
+  } else if (body.action === 'chat') {
+    const message = text(body.text, 240);
+    if (!message) fail('Enter a message (1–240 characters).');
+    const last = messages.findLast(m => m.name === player.name);
+    if (last && last.time > now() - 1) fail('Wait a moment before sending another message.', 429);
+    messages.push({ name: player.name, text: message, time: now() });
+    if (messages.length > 30) messages.shift();
+  } else fail('Unknown action.');
+  return { ok: true, state: snapshot() };
+}
+const mime = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascript', '.wasm': 'application/wasm', '.data': 'application/octet-stream', '.json': 'application/json', '.css': 'text/css', '.png': 'image/png', '.ico': 'image/x-icon' };
+const server = http.createServer(async (req, res) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  const origin = req.headers.origin;
+  const sameOrigin = origin === `http://${req.headers.host}` || origin === `https://${req.headers.host}`;
+  const corsAllowed = !origin || sameOrigin || (allowedOrigin && origin === allowedOrigin);
+  if (!corsAllowed) { res.writeHead(403); res.end('Origin not allowed.'); return; }
+  if (origin) { res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary', 'Origin'); }
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+  if (req.url === '/health' && (req.method === 'GET' || req.method === 'HEAD')) { res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(req.method === 'HEAD' ? '' : JSON.stringify({ ok: true, service: 'office-multiplayer' })); return; }
+  if (req.url === '/api/office' && req.method === 'POST') {
+    res.setHeader('Content-Type', 'application/json'); res.setHeader('Cache-Control', 'no-store');
+    try {
+      let bytes = 0;
+      const chunks = [];
+      for await (const chunk of req) {
+        bytes += chunk.length;
+        if (bytes > 32768) fail('Request too large.', 413);
+        chunks.push(chunk);
+      }
+      let body;
+      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { fail('Invalid JSON.'); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) fail('Invalid request.');
+      const result = transact(body);
+      res.writeHead(200); res.end(JSON.stringify(result));
+    } catch (error) {
+      // transact must run before writing headers so conflict and auth failures keep their status.
+      if (!res.headersSent) res.writeHead(error.status || 500);
+      res.end(JSON.stringify({ ok: false, error: error.status ? error.message : 'Unable to save the update. Please retry.' }));
+    }
+    return;
+  }
+  if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); res.end(); return; }
+  try {
+    let pathname = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
+    if (pathname === '/') pathname = '/index.html';
+    const file = path.resolve(buildRoot, '.' + pathname);
+    if (!file.startsWith(buildRoot + path.sep) || !fs.statSync(file).isFile() || !fs.realpathSync(file).startsWith(buildRoot + path.sep)) throw new Error('not found');
+    const compressed = /\.(gz|br)$/.test(file);
+    const plain = compressed ? file.replace(/\.(gz|br)$/, '') : file;
+    res.setHeader('Content-Type', mime[path.extname(plain)] || 'application/octet-stream');
+    if (compressed) res.setHeader('Content-Encoding', file.endsWith('.br') ? 'br' : 'gzip');
+    res.setHeader('Cache-Control', path.extname(plain) === '.html' ? 'no-cache' : 'public, max-age=3600');
+    res.writeHead(200);
+    if (req.method === 'HEAD') res.end(); else fs.createReadStream(file).pipe(res);
+  } catch {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Build not found. In Unity use Office Digital Twin > Build WebGL, then reopen this address.');
+  }
+});
+server.requestTimeout = 10000;
+server.headersTimeout = 10000;
+server.listen(port, host, () => console.log(`Office server: http://${host}:${port}`));
