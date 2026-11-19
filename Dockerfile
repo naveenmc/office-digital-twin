@@ -1,6 +1,6 @@
 FROM node:24-alpine AS assemble
 WORKDIR /app
-COPY office-asset-* office-files.json assemble-office.mjs restore-build.mjs build-parts.json ./
+COPY office-asset-* office-files-next.json assemble-office.mjs build-parts-next.json ./
 RUN node assemble-office.mjs
 FROM node:24-alpine
 WORKDIR /app
