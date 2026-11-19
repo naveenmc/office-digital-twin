@@ -1,3 +1,4 @@
+import {gunzipSync, gzipSync} from 'node:zlib';
 import fs from 'node:fs';
 import path from 'node:path';
 for (const [source, destination] of Object.entries(JSON.parse(fs.readFileSync('office-files.json', 'utf8')))) {
@@ -27,3 +28,12 @@ let html = fs.readFileSync(index, 'utf8');
 if (!html.includes('createUnityInstance(canvas, config,') || !html.includes('script.onload = () => {')) throw new Error('Unexpected Unity template');
 html = html.replace('      script.onload = () => {', bootstrap + '      script.onload = async () => {\n        try { config.dataUrl = await loadOfficeData(); } catch (error) { unityShowBanner(error.message, "error"); return; }');
 fs.writeFileSync(index, html);
+
+const framework = path.join(web, 'Build', 'WebGL.framework.js.gz');
+const original = gunzipSync(fs.readFileSync(framework)).toString('utf8');
+const oldConfig = 'new RTCPeerConnection({iceServers:[]})';
+if (original.split(oldConfig).length !== 2) throw new Error('Unexpected voice configuration');
+const updated = original.replace(oldConfig, 'new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]})')
+  .replace('Microphone ON. Joined colleagues can hear you.', 'Microphone ON. Audio requires a connected peer.');
+fs.writeFileSync(framework, gzipSync(updated));
+fs.writeFileSync(index, html.replace(/WebGL.framework.js.gz\?v=\d+/, 'WebGL.framework.js.gz?v=voice-stun-1'));
