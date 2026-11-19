@@ -1,0 +1,11 @@
+[
+  {
+    "target": "Builds/WebGL/Build/WebGL.data.gz",
+    "parts": [
+      "Builds/WebGL/Build/WebGL.data.gz.part0",
+      "Builds/WebGL/Build/WebGL.data.gz.part1",
+      "Builds/WebGL/Build/WebGL.data.gz.part2"
+    ],
+    "sha256": "6ff22122c8dab67abedc3b32028d0989c6afee3fa7e353db65a794fa111e6043"
+  }
+]
