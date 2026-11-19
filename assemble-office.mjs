@@ -1,13 +1,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 for (const [source, destination] of Object.entries(JSON.parse(fs.readFileSync('office-files-next.json', 'utf8')))) {
   fs.mkdirSync(path.dirname(destination), {recursive: true});
   fs.renameSync(source, destination);
 }
 const [data] = JSON.parse(fs.readFileSync('build-parts-next.json', 'utf8'));
+const hash = createHash('sha256');
+for (const part of data.parts) hash.update(fs.readFileSync(part));
+if (hash.digest('hex') !== data.sha256) throw new Error('Office data chunks do not match the build manifest');
 const web = 'Builds/WebGL';
 const index = path.join(web, 'index.html');
-const parts = data.parts.map(file => file.slice(web.length + 1));
+const parts = data.parts.map(file => file.slice(web.length + 1) + '?v=' + data.sha256);
 const bootstrap = `async function loadOfficeData() {
   const parts = ${JSON.stringify(parts)};
   const buffers = await Promise.all(parts.map(async (url) => {
